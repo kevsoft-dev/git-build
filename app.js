@@ -1,11 +1,8 @@
-// ===== Login GitHub (device flow, seperti `gh auth login` di Termux) =====
-// Isi dengan Client ID OAuth App milikmu (Settings > Developer settings > OAuth Apps,
-// centang "Enable Device Flow"). Bisa juga diisi lewat menu Pengaturan di app.
-const DEFAULT_CLIENT_ID = "Ov23li5FPClRpf4tZvRR";
-const SCOPE = "repo workflow";   // "workflow" perlu agar bisa push .github/workflows
+// ===== kev-git: deploy ZIP ke GitHub hanya pakai Personal Access Token (API key) =====
+const API = 'https://api.github.com';
+const MAX_FILE_BYTES = 50 * 1024 * 1024;   // file lebih besar dilewati (batas aman blob API)
+const PARALLEL = 4;                         // jumlah upload blob bersamaan
 let TOKEN = localStorage.getItem('kg_token') || "";
-let loginAbort = false;
-let wakeUp = null;
 
 // Layanan latar belakang Android (hanya ada di dalam APK; di browser diabaikan)
 const BG = (window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform())
@@ -18,38 +15,22 @@ async function bg(method, opts) {
 
 document.addEventListener("DOMContentLoaded", () => {
     renderHistory();
-    document.getElementById('clientId').value = getClientId();
-    // Client ID sudah tertanam di kode -> sembunyikan kolomnya, user cukup tekan Login
-    if (DEFAULT_CLIENT_ID.trim()) document.getElementById('clientIdGroup').classList.add('hidden');
-    if (TOKEN) loadRepos();
-});
-
-// Saat balik dari browser ke app, langsung cek status login tanpa nunggu interval
-document.addEventListener("visibilitychange", () => {
-    if (!document.hidden && wakeUp) wakeUp();
+    if (TOKEN) loadRepos(true);
 });
 
 function writeLog(text, color = "#00ff66") {
-    const l = document.getElementById('log'); 
+    const l = document.getElementById('log');
     l.style.display = "block";
-    const e = document.createElement('div'); 
-    e.style.color = color; 
+    const e = document.createElement('div');
+    e.style.color = color;
     e.textContent = "› " + text;
-    l.appendChild(e); 
+    l.appendChild(e);
     l.scrollTop = l.scrollHeight;
 }
 
-async function getBase64(data) {
-    return new Promise(r => {
-        const reader = new FileReader();
-        reader.onload = e => r(window.btoa(e.target.result));
-        reader.readAsBinaryString(new Blob([data]));
-    });
-}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-function getClientId() {
-    return (localStorage.getItem('kg_client_id') || DEFAULT_CLIENT_ID).trim();
-}
+class FatalError extends Error {}
 
 function ghHeaders(json) {
     const h = { 'Authorization': `Bearer ${TOKEN}`, 'Accept': 'application/vnd.github+json' };
@@ -57,251 +38,309 @@ function ghHeaders(json) {
     return h;
 }
 
-function sleepOrWake(ms) {
-    return new Promise(r => {
-        const t = setTimeout(() => { wakeUp = null; r(); }, ms);
-        wakeUp = () => { clearTimeout(t); wakeUp = null; r(); };
-    });
-}
-
-async function postJson(url, body) {
-    const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-    });
-    return res.json();
-}
-
-async function startLogin() {
-    const typed = document.getElementById('clientId').value.trim();
-    if (typed && !DEFAULT_CLIENT_ID.trim()) localStorage.setItem('kg_client_id', typed);
-    const clientId = DEFAULT_CLIENT_ID.trim() || getClientId();
-    if (!clientId) return alert("Client ID belum diisi. Isi DEFAULT_CLIENT_ID di app.js atau lewat menu Pengaturan.");
-
-    const btn = document.getElementById('loginBtn');
-    btn.disabled = true;
-    loginAbort = false;
-    await bg('start', { text: 'Menunggu login GitHub...' });
-
-    try {
-        const d = await postJson('https://github.com/login/device/code', { client_id: clientId, scope: SCOPE });
-        if (d.error) throw new Error(d.error_description || d.error);
-
-        window.__verifyUrl = d.verification_uri || 'https://github.com/login/device';
-        document.getElementById('userCode').textContent = d.user_code;
-        document.getElementById('loginIdle').classList.add('hidden');
-        document.getElementById('loginCode').classList.remove('hidden');
-        setLoginStatus("Menunggu otorisasi...");
-        copyCode(true);
-
-        const token = await pollToken(clientId, d);
-        TOKEN = token;
-        localStorage.setItem('kg_token', TOKEN);
-        await loadRepos();
-    } catch (e) {
-        if (!loginAbort) {
-            const msg = (e instanceof TypeError)
-                ? "Gagal terhubung ke GitHub. Login kode hanya jalan di APK; di browser pakai token manual."
-                : e.message;
-            alert(msg);
+// fetch ke GitHub dengan retry otomatis (jaringan putus, 5xx, rate limit)
+async function gh(path, opts = {}, tries = 5) {
+    const { method = 'GET', body } = opts;
+    const url = path.startsWith('http') ? path : API + path;
+    let lastErr = null;
+    for (let i = 0; i < tries; i++) {
+        try {
+            const res = await fetch(url, {
+                method,
+                headers: ghHeaders(body !== undefined),
+                body: body !== undefined ? JSON.stringify(body) : undefined
+            });
+            if (res.status === 401) throw new FatalError("Token tidak valid atau sudah kedaluwarsa (401).");
+            if (res.status === 403 || res.status === 429) {
+                const text = await res.clone().text();
+                const retryAfter = parseInt(res.headers.get('retry-after') || '0', 10);
+                const remaining = res.headers.get('x-ratelimit-remaining');
+                const reset = parseInt(res.headers.get('x-ratelimit-reset') || '0', 10);
+                const limited = retryAfter || remaining === '0' || /rate limit|abuse|secondary/i.test(text);
+                if (!limited) return res;                       // 403 biasa (izin kurang) -> biar caller yang lapor
+                let wait = retryAfter * 1000;
+                if (!wait && remaining === '0' && reset) wait = Math.max(1000, reset * 1000 - Date.now() + 1000);
+                if (!wait) wait = 15000 * (i + 1);
+                if (wait > 90000) throw new FatalError("Rate limit GitHub habis, coba lagi beberapa menit lagi.");
+                writeLog(`Kena rate limit, menunggu ${Math.ceil(wait / 1000)} dtk...`, "#f5a623");
+                await sleep(wait);
+                continue;
+            }
+            if (res.status >= 500) {
+                lastErr = new Error("Server GitHub error " + res.status);
+                await sleep(1000 * (i + 1));
+                continue;
+            }
+            return res;
+        } catch (e) {
+            if (e instanceof FatalError) throw e;
+            lastErr = e;
+            await sleep(1000 * (i + 1));
         }
-        resetLoginUi();
+    }
+    throw new Error("Koneksi ke GitHub gagal: " + (lastErr ? lastErr.message : "tidak diketahui"));
+}
+
+async function errMsg(res) {
+    try {
+        const j = await res.json();
+        return (j && j.message) ? j.message : ("HTTP " + res.status);
+    } catch (e) { return "HTTP " + res.status; }
+}
+
+async function must(res, what) {
+    if (res.ok) return res;
+    const m = await errMsg(res);
+    let hint = "";
+    if (/workflow/i.test(m)) hint = " → Token perlu izin 'workflow' (classic) / 'Workflows: Read and write' (fine-grained).";
+    else if (/protected branch|required status|review/i.test(m)) hint = " → Branch diproteksi, matikan proteksi atau pakai repo lain.";
+    else if (res.status === 403 || res.status === 404) hint = " → Cek izin token ke repo ini (Contents: Read and write).";
+    throw new Error(`${what} gagal (${res.status}): ${m}${hint}`);
+}
+
+// ===== Login pakai token =====
+async function connect() {
+    const t = document.getElementById('token').value.trim();
+    if (!t) return alert("Isi token dulu.");
+    TOKEN = t;
+    const btn = document.getElementById('connectBtn');
+    btn.disabled = true;
+    try {
+        await loadRepos(false);
     } finally {
         btn.disabled = false;
-        await bg('stop', { text: TOKEN ? "Login GitHub berhasil" : "Login dibatalkan" });
     }
 }
 
-async function pollToken(clientId, d) {
-    let interval = (d.interval || 5) * 1000;
-    const deadline = Date.now() + (d.expires_in || 900) * 1000;
-    while (!loginAbort && Date.now() < deadline) {
-        await sleepOrWake(interval);
-        if (loginAbort) break;
-        const t = await postJson('https://github.com/login/oauth/access_token', {
-            client_id: clientId,
-            device_code: d.device_code,
-            grant_type: 'urn:ietf:params:oauth:grant-type:device_code'
-        });
-        if (t.access_token) return t.access_token;
-        if (t.error === 'authorization_pending') continue;
-        if (t.error === 'slow_down') { interval = (t.interval ? t.interval * 1000 : interval + 5000); continue; }
-        if (t.error === 'expired_token') throw new Error("Kode kedaluwarsa, coba login lagi.");
-        if (t.error === 'access_denied') throw new Error("Login ditolak.");
-        throw new Error(t.error_description || t.error || "Login gagal");
-    }
-    if (loginAbort) throw new Error("dibatalkan");
-    throw new Error("Kode kedaluwarsa, coba login lagi.");
-}
-
-function setLoginStatus(t) { document.getElementById('loginStatus').textContent = t; }
-
-async function copyCode(silent) {
-    const code = document.getElementById('userCode').textContent;
+async function loadRepos(silent) {
     try {
-        await navigator.clipboard.writeText(code);
-        setLoginStatus(silent ? "Kode disalin. Buka GitHub lalu tempel." : "Kode disalin.");
-    } catch (e) {
-        if (!silent) alert("Salin manual: " + code);
-    }
-}
-
-function openVerify() {
-    window.open(window.__verifyUrl || 'https://github.com/login/device', '_blank');
-}
-
-function cancelLogin() {
-    loginAbort = true;
-    if (wakeUp) wakeUp();
-    resetLoginUi();
-}
-
-function resetLoginUi() {
-    document.getElementById('loginCode').classList.add('hidden');
-    document.getElementById('loginIdle').classList.remove('hidden');
-}
-
-async function connectManual() {
-    const t = document.getElementById('token').value.trim();
-    if (!t) return;
-    TOKEN = t;
-    localStorage.setItem('kg_token', TOKEN);
-    await loadRepos();
-}
-
-async function loadRepos() {
-    try {
-        const [meRes, res] = await Promise.all([
-            fetch('https://api.github.com/user', { headers: ghHeaders() }),
-            fetch('https://api.github.com/user/repos?per_page=100&sort=pushed', { headers: ghHeaders() })
-        ]);
-        if (meRes.status === 401 || res.status === 401) throw new Error("Sesi login habis, silakan login lagi.");
-        if (!res.ok) throw new Error("Gagal memuat repo (" + res.status + ")");
+        const meRes = await gh('/user');
+        await must(meRes, "Cek token");
         const me = await meRes.json();
-        const d = await res.json();
+
+        const scopes = meRes.headers.get('x-oauth-scopes');   // hanya ada di token classic
+        if (scopes !== null) {
+            const list = scopes.split(',').map(s => s.trim());
+            if (!list.includes('repo')) throw new FatalError("Token classic belum punya scope 'repo'.");
+            if (!list.includes('workflow')) writeLog("Peringatan: token tanpa scope 'workflow' tidak bisa push folder .github/workflows.", "#f5a623");
+        }
+
+        let repos = [];
+        for (let page = 1; page <= 10; page++) {
+            const r = await gh(`/user/repos?per_page=100&sort=pushed&page=${page}`);
+            await must(r, "Memuat repo");
+            const d = await r.json();
+            repos = repos.concat(d);
+            if (d.length < 100) break;
+        }
+        repos = repos.filter(r => !r.archived && (!r.permissions || r.permissions.push !== false));
+        if (!repos.length) throw new Error("Tidak ada repo yang bisa kamu push.");
+
+        localStorage.setItem('kg_token', TOKEN);
         document.getElementById('whoami').textContent = "@" + me.login;
-        document.getElementById('repoList').innerHTML = d.map(r => `<option value="${r.full_name}">${r.full_name}</option>`).join('');
+        document.getElementById('repoList').innerHTML = repos.map(r => `<option value="${r.full_name}">${r.full_name}</option>`).join('');
         document.getElementById('step1').classList.add('hidden');
         document.getElementById('step2').classList.remove('hidden');
         writeLog("Ready.");
     } catch (e) {
-        TOKEN = "";
-        localStorage.removeItem('kg_token');
-        resetLoginUi();
+        const bad = e instanceof FatalError || /401|Token/.test(e.message);
+        if (bad) { TOKEN = ""; localStorage.removeItem('kg_token'); }
         document.getElementById('step1').classList.remove('hidden');
         document.getElementById('step2').classList.add('hidden');
-        alert(e.message);
+        if (!(silent && !bad)) alert(e.message);
     }
 }
 
 function logout() {
     TOKEN = "";
     localStorage.removeItem('kg_token');
+    document.getElementById('token').value = "";
     document.getElementById('step2').classList.add('hidden');
     document.getElementById('step1').classList.remove('hidden');
-    resetLoginUi();
 }
 
+// ===== Util ZIP =====
+function toBase64(u8) {
+    let s = '';
+    const CH = 0x8000;
+    for (let i = 0; i < u8.length; i += CH) s += String.fromCharCode.apply(null, u8.subarray(i, i + CH));
+    return btoa(s);
+}
+
+function cleanPath(p) {
+    p = p.replace(/\\/g, '/').replace(/^(\.\/)+/, '').replace(/^\/+/, '');
+    const parts = p.split('/');
+    if (parts.some(x => x === '..' || x === '')) return null;
+    if (parts[0] === '.git') return null;
+    return parts.join('/');
+}
+
+async function runPool(items, limit, worker) {
+    let next = 0;
+    const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+        while (true) {
+            const i = next++;
+            if (i >= items.length) return;
+            await worker(items[i], i);
+        }
+    });
+    await Promise.all(runners);
+}
+
+// Pastikan branch ada (repo kosong dibuatkan commit awal otomatis)
+async function ensureBranch(repo, branch) {
+    for (let attempt = 0; attempt < 6; attempt++) {
+        const r = await gh(`/repos/${repo}/git/ref/heads/${encodeURIComponent(branch)}`);
+        if (r.ok) return (await r.json()).object.sha;
+        if (r.status === 404 || r.status === 409) {
+            if (attempt === 0) {
+                writeLog("Repo kosong, membuat commit awal...");
+                const init = await gh(`/repos/${repo}/contents/.kev-git-init`, {
+                    method: 'PUT',
+                    body: { message: "init", content: btoa("init"), branch }
+                });
+                if (!init.ok && init.status !== 422) await must(init, "Inisialisasi repo kosong");
+            }
+            await sleep(1500);
+            continue;
+        }
+        await must(r, "Membaca branch");
+    }
+    throw new Error("Branch '" + branch + "' tidak ditemukan dan gagal dibuat.");
+}
+
+// ===== Deploy =====
 async function startDeploy() {
     const repo = document.getElementById('repoList').value;
     const file = document.getElementById('zipInput').files[0];
-    if(!file) return alert("Pilih ZIP!");
-    const btn = document.getElementById('deployBtn'); 
+    if (!repo) return alert("Pilih repo!");
+    if (!file) return alert("Pilih ZIP!");
+    const btn = document.getElementById('deployBtn');
     btn.disabled = true;
     let finalText = "Deploy gagal";
     await bg('start', { text: `Mengunggah ke ${repo}...` });
-    
+
     try {
         writeLog(`Initializing ${repo}...`);
-        const repoRes = await fetch(`https://api.github.com/repos/${repo}`, { 
-            headers: ghHeaders() 
-        });
+        const repoRes = await gh(`/repos/${repo}`);
+        await must(repoRes, "Membaca repo");
         const repoInfo = await repoRes.json();
-        const branch = repoInfo.default_branch;
-        
-        const branchRes = await fetch(`https://api.github.com/repos/${repo}/branches/${branch}`, { 
-            headers: ghHeaders() 
-        });
-        const branchInfo = await branchRes.json();
-        const parentSha = branchInfo.commit.sha;
-        
-        const arrayBuffer = await file.arrayBuffer();
-        const zip = await JSZip.loadAsync(arrayBuffer);
-        const files = Object.keys(zip.files).filter(k => !zip.files[k].dir);
-        
-        const firstFolder = files[0].split('/')[0];
-        const isNested = files.every(f => f.startsWith(firstFolder + '/'));
-        
-        const tree = [];
-        let n = 0;
-        for(const f of files) {
-            n++;
-            bg('update', { text: `Mengunggah ${n}/${files.length}: ${f}` });
-            writeLog("Push: " + f);
-            const content = await zip.files[f].async("uint8array");
-            const b64 = await getBase64(content);
-            const blobRes = await fetch(`https://api.github.com/repos/${repo}/git/blobs`, {
-                method: 'POST', 
-                headers: ghHeaders(true),
-                body: JSON.stringify({ content: b64, encoding: 'base64' })
-            });
-            const blob = await blobRes.json();
-            if(!blob.sha) throw new Error("Gagal mengunggah " + f);
-            
-            const githubPath = isNested ? f.substring(f.indexOf('/') + 1) : f;
-            if(!githubPath) continue;
+        if (repoInfo.archived) throw new Error("Repo diarsipkan (read-only).");
+        if (repoInfo.permissions && repoInfo.permissions.push === false) throw new Error("Token tidak punya izin push ke repo ini.");
+        const branch = repoInfo.default_branch || 'main';
 
-            tree.push({ path: githubPath, mode: "100644", type: "blob", sha: blob.sha });
+        // Baca ZIP
+        let zip;
+        try { zip = await JSZip.loadAsync(await file.arrayBuffer()); }
+        catch (e) { throw new Error("File ZIP rusak atau tidak bisa dibaca."); }
+
+        let entries = [];
+        for (const name of Object.keys(zip.files)) {
+            const z = zip.files[name];
+            if (z.dir) continue;
+            if (/(^|\/)(__MACOSX\/|\.DS_Store$|Thumbs\.db$)/.test(name)) continue;
+            const norm = name.replace(/\\/g, '/');
+            entries.push({ zipName: name, norm });
         }
-        
-        const treeRes = await fetch(`https://api.github.com/repos/${repo}/git/trees`, {
-            method: 'POST', 
-            headers: ghHeaders(true),
-            body: JSON.stringify({ tree })
+        if (!entries.length) throw new Error("ZIP kosong.");
+
+        // Kalau semua file ada di dalam satu folder induk, buang folder itu
+        const firstFolder = entries[0].norm.split('/')[0];
+        const isNested = entries[0].norm.includes('/') && entries.every(x => x.norm.startsWith(firstFolder + '/'));
+
+        const items = new Map();
+        for (const x of entries) {
+            const rel = isNested ? x.norm.substring(firstFolder.length + 1) : x.norm;
+            const p = cleanPath(rel);
+            if (!p) { writeLog("Lewati path tidak valid: " + x.norm, "#f5a623"); continue; }
+            items.set(p, x.zipName);
+        }
+        if (!items.size) throw new Error("Tidak ada file valid di ZIP.");
+
+        const branchSha = await ensureBranch(repo, branch);
+
+        // Upload blob (paralel + retry)
+        const list = Array.from(items.entries());
+        const tree = [];
+        let done = 0;
+        await runPool(list, PARALLEL, async ([path, zipName]) => {
+            const zf = zip.files[zipName];
+            const data = await zf.async("uint8array");
+            done++;
+            if (data.length > MAX_FILE_BYTES) {
+                writeLog(`Lewati (terlalu besar >50MB): ${path}`, "#f5a623");
+                return;
+            }
+            bg('update', { text: `Mengunggah ${done}/${list.length}: ${path}` });
+            writeLog("Push: " + path);
+            const body = data.length
+                ? { content: toBase64(data), encoding: 'base64' }
+                : { content: "", encoding: 'utf-8' };
+            const r = await gh(`/repos/${repo}/git/blobs`, { method: 'POST', body });
+            if (!r.ok) {
+                if (!data.length) { writeLog("Lewati file kosong: " + path, "#f5a623"); return; }
+                await must(r, "Upload " + path);
+            }
+            const blob = await r.json();
+            if (!blob.sha) throw new Error("Gagal mengunggah " + path);
+            const exec = zf.unixPermissions && (zf.unixPermissions & 0o111);
+            tree.push({ path, mode: exec ? "100755" : "100644", type: "blob", sha: blob.sha });
         });
+        if (!tree.length) throw new Error("Tidak ada file yang berhasil diunggah.");
+        tree.sort((a, b) => a.path < b.path ? -1 : 1);
+
+        writeLog("Membuat tree...");
+        const treeRes = await gh(`/repos/${repo}/git/trees`, { method: 'POST', body: { tree } });
+        await must(treeRes, "Membuat tree");
         const newTree = await treeRes.json();
-        
-        const commitRes = await fetch(`https://api.github.com/repos/${repo}/git/commits`, {
-            method: 'POST', 
-            headers: ghHeaders(true),
-            body: JSON.stringify({ message: "⚡ kev-git build", tree: newTree.sha, parents: [parentSha] })
+
+        // Ambil ulang SHA branch terbaru supaya parent selalu valid
+        const parentSha = await ensureBranch(repo, branch).catch(() => branchSha);
+
+        writeLog("Membuat commit...");
+        const commitRes = await gh(`/repos/${repo}/git/commits`, {
+            method: 'POST',
+            body: { message: "⚡ kev-git build", tree: newTree.sha, parents: [parentSha] }
         });
+        await must(commitRes, "Membuat commit");
         const commit = await commitRes.json();
-        
-        const refRes = await fetch(`https://api.github.com/repos/${repo}/git/refs/heads/${branch}`, {
-            method: 'PATCH', 
-            headers: ghHeaders(true),
-            body: JSON.stringify({ sha: commit.sha, force: true })
+
+        writeLog("Memperbarui branch " + branch + "...");
+        const refRes = await gh(`/repos/${repo}/git/refs/heads/${encodeURIComponent(branch)}`, {
+            method: 'PATCH',
+            body: { sha: commit.sha, force: true }
         });
-        if(!refRes.ok) throw new Error("Gagal memperbarui branch (" + refRes.status + ")");
-        
+        await must(refRes, "Memperbarui branch");
+
         finalText = "Deploy selesai: " + repo;
         writeLog("Deployment success.", "#50e3c2");
         saveHistory(repo);
         alert("Done!");
-    } catch(e) { 
+    } catch (e) {
         finalText = "Deploy gagal: " + e.message;
-        writeLog("Error: " + e.message, "#ee0000"); 
-    } finally { 
-        btn.disabled = false; 
+        writeLog("Error: " + e.message, "#ee0000");
+        if (e instanceof FatalError) logout();
+    } finally {
+        btn.disabled = false;
         await bg('stop', { text: finalText });
     }
 }
 
+// ===== Riwayat =====
 function saveHistory(repo) {
-    let history = JSON.parse(localStorage.getItem('kg_hist')) || [];
-    const newLog = { repo: repo, time: new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) };
-    history.unshift(newLog);
-    if(history.length > 3) history.pop();
+    let history = [];
+    try { history = JSON.parse(localStorage.getItem('kg_hist')) || []; } catch (e) {}
+    history.unshift({ repo: repo, time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) });
+    if (history.length > 3) history.pop();
     localStorage.setItem('kg_hist', JSON.stringify(history));
     renderHistory();
 }
 
 function renderHistory() {
-    const history = JSON.parse(localStorage.getItem('kg_hist')) || [];
+    let history = [];
+    try { history = JSON.parse(localStorage.getItem('kg_hist')) || []; } catch (e) {}
     const container = document.getElementById('historyContainer');
-    if(history.length === 0) {
+    if (history.length === 0) {
         container.innerHTML = '<div class="history-empty">No deployments logged.</div>';
         return;
     }
