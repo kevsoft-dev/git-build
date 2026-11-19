@@ -1,0 +1,112 @@
+name: Git Pusher
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: "Repo tujuan (owner/nama-repo)"
+        required: true
+        type: string
+      zip_path:
+        description: "Path ZIP di repo ini (contoh: uploads/bundle.zip)"
+        required: false
+        default: "uploads/bundle.zip"
+        type: string
+      zip_url:
+        description: "ATAU URL ZIP (jika diisi, dipakai menggantikan zip_path)"
+        required: false
+        type: string
+      branch:
+        description: "Branch tujuan (kosong = branch default)"
+        required: false
+        type: string
+      delay_min:
+        description: "Jeda minimum antar commit (detik)"
+        required: false
+        default: "4"
+        type: string
+      delay_max:
+        description: "Jeda maksimum antar commit (detik)"
+        required: false
+        default: "9"
+        type: string
+      commit_message:
+        description: "Kosong = gaya GitHub web (Create/Update <file>). Bisa pakai {action} dan {file}"
+        required: false
+        type: string
+      skip_unchanged:
+        description: "Lewati file yang isinya sudah sama"
+        required: false
+        default: true
+        type: boolean
+      delete_missing:
+        description: "Hapus file di repo tujuan yang tidak ada di ZIP"
+        required: false
+        default: false
+        type: boolean
+      chain:
+        description: "Internal: penghitung lanjutan otomatis (biarkan 0)"
+        required: false
+        default: "0"
+        type: string
+
+permissions:
+  contents: read
+  actions: write   # untuk melanjutkan diri sendiri bila file sangat banyak
+
+concurrency:
+  group: git-pusher-${{ inputs.target_repo }}
+  cancel-in-progress: false
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Push file satu per satu
+        id: push
+        env:
+          PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          ZIP_PATH: ${{ inputs.zip_path }}
+          ZIP_URL: ${{ inputs.zip_url }}
+          BRANCH: ${{ inputs.branch }}
+          DELAY_MIN: ${{ inputs.delay_min }}
+          DELAY_MAX: ${{ inputs.delay_max }}
+          COMMIT_MESSAGE: ${{ inputs.commit_message }}
+          SKIP_UNCHANGED: ${{ inputs.skip_unchanged }}
+          DELETE_MISSING: ${{ inputs.delete_missing }}
+          MAX_RUNTIME: "16200"   # 4,5 jam, lalu lanjut run baru
+          PER_HOUR: "450"        # batas GitHub 500 commit/jam
+          PER_MINUTE: "50"       # batas GitHub 80/menit
+        run: python3 scripts/pusher.py
+
+      - name: Lanjutkan di run berikutnya (latar belakang)
+        if: steps.push.outputs.resume == 'true' && fromJSON(inputs.chain) < 30
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NEXT: ${{ fromJSON(inputs.chain) + 1 }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          ZIP_PATH: ${{ inputs.zip_path }}
+          ZIP_URL: ${{ inputs.zip_url }}
+          BRANCH: ${{ inputs.branch }}
+          DELAY_MIN: ${{ inputs.delay_min }}
+          DELAY_MAX: ${{ inputs.delay_max }}
+          COMMIT_MESSAGE: ${{ inputs.commit_message }}
+          SKIP_UNCHANGED: ${{ inputs.skip_unchanged }}
+          DELETE_MISSING: ${{ inputs.delete_missing }}
+        run: |
+          gh workflow run git-pusher.yml --ref "$GITHUB_REF_NAME" \
+            -f target_repo="$TARGET_REPO" \
+            -f zip_path="$ZIP_PATH" \
+            -f zip_url="$ZIP_URL" \
+            -f branch="$BRANCH" \
+            -f delay_min="$DELAY_MIN" \
+            -f delay_max="$DELAY_MAX" \
+            -f commit_message="$COMMIT_MESSAGE" \
+            -f skip_unchanged="$SKIP_UNCHANGED" \
+            -f delete_missing="$DELETE_MISSING" \
+            -f chain="$NEXT"
