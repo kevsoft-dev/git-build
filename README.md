@@ -5,7 +5,7 @@ Aplikasi Android untuk push isi ZIP ke repo GitHub, 1 file = 1 commit
 
 ## Build APK tanpa Android Studio
 1. Buat repo baru di GitHub, upload seluruh isi folder ini (termasuk `.github`).
-2. Buka tab **Actions → Build APK → tombol Run workflow** (isi versi, lalu Run).
+2. Buka tab **Actions → Build APK → Run workflow**, isi nama, package, versi, warna logo, lalu Run.
    (Workflow harus ada di branch default repo agar tombolnya muncul.)
 3. Selesai ±5 menit → buka **Releases**, unduh `GitPusher-v….apk`, install di HP.
 

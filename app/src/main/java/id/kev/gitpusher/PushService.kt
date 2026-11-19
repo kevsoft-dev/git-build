@@ -58,7 +58,7 @@ class PushService : Service() {
     private fun notif(text: String, done: Int, total: Int, ongoing: Boolean): Notification {
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         val b = Notification.Builder(this, CH)
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            .setSmallIcon(R.drawable.ic_stat_github)
             .setContentTitle("Git Pusher")
             .setContentText(text)
             .setContentIntent(open)

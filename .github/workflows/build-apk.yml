@@ -1,21 +1,44 @@
 name: Build APK
 
-run-name: Build APK v${{ inputs.version_name }} (#${{ github.run_number }})
+run-name: Build ${{ inputs.app_name }} v${{ inputs.version_name }} (#${{ github.run_number }})
 
-# Hanya manual: muncul tombol "Run workflow" di tab Actions
+# Manual: tombol "Run workflow" di tab Actions
 on:
   workflow_dispatch:
     inputs:
+      app_name:
+        description: "Nama aplikasi (tampil di HP)"
+        required: true
+        default: "Git Pusher"
+        type: string
+      package_name:
+        description: "Package / Application ID (huruf kecil, contoh: id.kev.gitpusher)"
+        required: true
+        default: "id.kev.gitpusher"
+        type: string
       version_name:
         description: "Versi aplikasi (contoh: 1.0)"
         required: true
         default: "1.0"
+        type: string
+      version_code:
+        description: "Version code (angka). Kosong = nomor build otomatis"
+        required: false
+        type: string
+      icon_color:
+        description: "Warna latar logo GitHub (hex 6 digit, contoh: 24292F)"
+        required: true
+        default: "24292F"
         type: string
       make_release:
         description: "Buat Release agar APK bisa diunduh langsung dari HP"
         required: true
         default: true
         type: boolean
+      release_notes:
+        description: "Catatan rilis (opsional)"
+        required: false
+        type: string
 
 permissions:
   contents: write   # untuk membuat Release berisi APK
@@ -25,46 +48,67 @@ jobs:
     name: Build APK
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      APP_NAME: ${{ inputs.app_name }}
+      PACKAGE_NAME: ${{ inputs.package_name }}
+      VERSION_NAME: ${{ inputs.version_name }}
+      VERSION_CODE_IN: ${{ inputs.version_code }}
+      ICON_COLOR: ${{ inputs.icon_color }}
+      RUN_NUMBER: ${{ github.run_number }}
     steps:
       - name: Ambil kode
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
+
+      - name: Cek pengaturan
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          [[ -n "${APP_NAME// /}" ]] || fail "Nama aplikasi tidak boleh kosong"
+          [[ "$PACKAGE_NAME" =~ ^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$ ]] \
+            || fail "Package tidak valid. Contoh benar: id.kev.gitpusher (huruf kecil, minimal 2 bagian dipisah titik)"
+          [[ "${ICON_COLOR#\#}" =~ ^[0-9A-Fa-f]{6}$ ]] || fail "Warna logo harus hex 6 digit, contoh 24292F"
+          [[ -z "$VERSION_CODE_IN" || "$VERSION_CODE_IN" =~ ^[0-9]{1,9}$ ]] || fail "Version code harus angka"
+          echo "VERSION_CODE=${VERSION_CODE_IN:-$RUN_NUMBER}" >> "$GITHUB_ENV"
 
       - name: Pasang Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Pasang Gradle 8.7
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: "8.7"
 
       - name: Build APK
-        env:
-          VERSION_NAME: ${{ inputs.version_name }}
         run: |
           gradle assembleDebug --no-daemon --stacktrace \
+            -PappName="$APP_NAME" \
+            -PappPackage="$PACKAGE_NAME" \
             -PappVersion="$VERSION_NAME" \
-            -PappCode="${{ github.run_number }}"
+            -PappCode="$VERSION_CODE" \
+            -PiconColor="${ICON_COLOR#\#}"
 
-      - name: Ganti nama APK
-        env:
-          VERSION_NAME: ${{ inputs.version_name }}
-        run: cp app/build/outputs/apk/debug/app-debug.apk "GitPusher-v${VERSION_NAME}.apk"
+      - name: Beri nama file APK
+        run: |
+          SAFE=$(printf '%s' "$APP_NAME" | tr -c 'A-Za-z0-9' '-' | sed 's/-*$//; s/^-*//')
+          APK="${SAFE:-App}-v${VERSION_NAME}.apk"
+          cp app/build/outputs/apk/debug/app-debug.apk "$APK"
+          echo "APK_FILE=$APK" >> "$GITHUB_ENV"
 
       - name: Simpan APK (Artifacts)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
-          name: GitPusher-apk
-          path: GitPusher-v*.apk
+          name: apk
+          path: ${{ env.APK_FILE }}
 
       - name: Buat Release
         if: ${{ inputs.make_release }}
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION_NAME: ${{ inputs.version_name }}
+          NOTES: ${{ inputs.release_notes }}
         run: |
-          gh release create "v${VERSION_NAME}-build${{ github.run_number }}" "GitPusher-v${VERSION_NAME}.apk" \
-            --title "Git Pusher v${VERSION_NAME} (build ${{ github.run_number }})" \
-            --notes "APK dibuat otomatis dari commit ${GITHUB_SHA::7}"
+          DEFAULT_NOTES="APK dibuat otomatis dari commit ${GITHUB_SHA::7}. Package: $PACKAGE_NAME"
+          gh release create "v${VERSION_NAME}-build${RUN_NUMBER}" "$APK_FILE" \
+            --title "$APP_NAME v${VERSION_NAME} (build ${RUN_NUMBER})" \
+            --notes "${NOTES:-$DEFAULT_NOTES}"

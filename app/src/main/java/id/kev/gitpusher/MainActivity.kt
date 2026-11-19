@@ -15,6 +15,7 @@ import android.view.View
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
@@ -49,7 +50,13 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(28), dp(16), dp(24))
         }
-        col.addView(TextView(this).apply { text = "Git Pusher"; textSize = 26f; typeface = Typeface.DEFAULT_BOLD })
+        val head = LinearLayout(this).apply { gravity = android.view.Gravity.CENTER_VERTICAL }
+        head.addView(ImageView(this).apply {
+            setImageResource(R.drawable.ic_stat_github)
+            setColorFilter(Color.parseColor("#24292F"))
+        }, LinearLayout.LayoutParams(dp(36), dp(36)).apply { rightMargin = dp(10) })
+        head.addView(TextView(this).apply { text = getString(R.string.app_name); textSize = 26f; typeface = Typeface.DEFAULT_BOLD })
+        col.addView(head)
 
         col.addView(label("GitHub Personal Token"))
         token = field("ghp_... / github_pat_...", prefs.getString("token", "") ?: "")
