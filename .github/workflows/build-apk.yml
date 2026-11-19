@@ -44,7 +44,7 @@ jobs:
       - name: Siapkan folder web (www)
         run: |
           rm -rf www && mkdir www
-          cp index.html app.js style.css www/
+          cp index.html app.js style.css icon.png www/
           cp node_modules/jszip/dist/jszip.min.js www/jszip.min.js
           sed -i 's#https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js#jszip.min.js#' www/index.html
           grep -q 'src="jszip.min.js"' www/index.html || { echo "::error::Gagal mengganti sumber JSZip di index.html."; exit 1; }
@@ -59,6 +59,11 @@ jobs:
           test -d "$pkg_dir" || { echo "::error::Folder $pkg_dir tidak ada. Pastikan appId di capacitor.config.json adalah com.kevsoft.gittools."; exit 1; }
           cp native/BgService.java native/BgServicePlugin.java native/MainActivity.java "$pkg_dir/"
           python3 native/patch_manifest.py android/app/src/main/AndroidManifest.xml
+
+      - name: Pasang ikon aplikasi
+        run: |
+          cp -r native/res/. android/app/src/main/res/
+          test -f android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png || { echo "::error::Ikon gagal dipasang."; exit 1; }
 
       - name: Sinkronkan aset web ke Android
         run: npx cap sync android

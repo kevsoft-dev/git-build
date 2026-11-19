@@ -1,7 +1,7 @@
 // ===== Login GitHub (device flow, seperti `gh auth login` di Termux) =====
 // Isi dengan Client ID OAuth App milikmu (Settings > Developer settings > OAuth Apps,
 // centang "Enable Device Flow"). Bisa juga diisi lewat menu Pengaturan di app.
-const DEFAULT_CLIENT_ID = "";
+const DEFAULT_CLIENT_ID = "Ov23li5FPClRpf4tZvRR";
 const SCOPE = "repo workflow";   // "workflow" perlu agar bisa push .github/workflows
 let TOKEN = localStorage.getItem('kg_token') || "";
 let loginAbort = false;
@@ -19,6 +19,8 @@ async function bg(method, opts) {
 document.addEventListener("DOMContentLoaded", () => {
     renderHistory();
     document.getElementById('clientId').value = getClientId();
+    // Client ID sudah tertanam di kode -> sembunyikan kolomnya, user cukup tekan Login
+    if (DEFAULT_CLIENT_ID.trim()) document.getElementById('clientIdGroup').classList.add('hidden');
     if (TOKEN) loadRepos();
 });
 
@@ -73,9 +75,9 @@ async function postJson(url, body) {
 
 async function startLogin() {
     const typed = document.getElementById('clientId').value.trim();
-    if (typed) localStorage.setItem('kg_client_id', typed);
-    const clientId = getClientId();
-    if (!clientId) return alert("Isi OAuth Client ID dulu di menu Pengaturan.");
+    if (typed && !DEFAULT_CLIENT_ID.trim()) localStorage.setItem('kg_client_id', typed);
+    const clientId = DEFAULT_CLIENT_ID.trim() || getClientId();
+    if (!clientId) return alert("Client ID belum diisi. Isi DEFAULT_CLIENT_ID di app.js atau lewat menu Pengaturan.");
 
     const btn = document.getElementById('loginBtn');
     btn.disabled = true;
