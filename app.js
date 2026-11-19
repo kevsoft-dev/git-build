@@ -1,4 +1,11 @@
-let TOKEN = "";
+// ===== Login GitHub (device flow, seperti `gh auth login` di Termux) =====
+// Isi dengan Client ID OAuth App milikmu (Settings > Developer settings > OAuth Apps,
+// centang "Enable Device Flow"). Bisa juga diisi lewat menu Pengaturan di app.
+const DEFAULT_CLIENT_ID = "";
+const SCOPE = "repo workflow";   // "workflow" perlu agar bisa push .github/workflows
+let TOKEN = localStorage.getItem('kg_token') || "";
+let loginAbort = false;
+let wakeUp = null;
 
 // Layanan latar belakang Android (hanya ada di dalam APK; di browser diabaikan)
 const BG = (window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform())
@@ -9,8 +16,15 @@ async function bg(method, opts) {
     try { await BG[method](opts || {}); } catch (e) { console.warn('BgService', method, e); }
 }
 
-document.addEventListener("DOMContentLoaded", () => { 
-    renderHistory(); 
+document.addEventListener("DOMContentLoaded", () => {
+    renderHistory();
+    document.getElementById('clientId').value = getClientId();
+    if (TOKEN) loadRepos();
+});
+
+// Saat balik dari browser ke app, langsung cek status login tanpa nunggu interval
+document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && wakeUp) wakeUp();
 });
 
 function writeLog(text, color = "#00ff66") {
@@ -31,22 +45,160 @@ async function getBase64(data) {
     });
 }
 
-async function connect() {
-    TOKEN = document.getElementById('token').value.trim();
-    if(!TOKEN) return;
+function getClientId() {
+    return (localStorage.getItem('kg_client_id') || DEFAULT_CLIENT_ID).trim();
+}
+
+function ghHeaders(json) {
+    const h = { 'Authorization': `Bearer ${TOKEN}`, 'Accept': 'application/vnd.github+json' };
+    if (json) h['Content-Type'] = 'application/json';
+    return h;
+}
+
+function sleepOrWake(ms) {
+    return new Promise(r => {
+        const t = setTimeout(() => { wakeUp = null; r(); }, ms);
+        wakeUp = () => { clearTimeout(t); wakeUp = null; r(); };
+    });
+}
+
+async function postJson(url, body) {
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+    });
+    return res.json();
+}
+
+async function startLogin() {
+    const typed = document.getElementById('clientId').value.trim();
+    if (typed) localStorage.setItem('kg_client_id', typed);
+    const clientId = getClientId();
+    if (!clientId) return alert("Isi OAuth Client ID dulu di menu Pengaturan.");
+
+    const btn = document.getElementById('loginBtn');
+    btn.disabled = true;
+    loginAbort = false;
+    await bg('start', { text: 'Menunggu login GitHub...' });
+
     try {
-        const res = await fetch('https://api.github.com/user/repos?per_page=100', { 
-            headers: {'Authorization': `token ${TOKEN}`} 
+        const d = await postJson('https://github.com/login/device/code', { client_id: clientId, scope: SCOPE });
+        if (d.error) throw new Error(d.error_description || d.error);
+
+        window.__verifyUrl = d.verification_uri || 'https://github.com/login/device';
+        document.getElementById('userCode').textContent = d.user_code;
+        document.getElementById('loginIdle').classList.add('hidden');
+        document.getElementById('loginCode').classList.remove('hidden');
+        setLoginStatus("Menunggu otorisasi...");
+        copyCode(true);
+
+        const token = await pollToken(clientId, d);
+        TOKEN = token;
+        localStorage.setItem('kg_token', TOKEN);
+        await loadRepos();
+    } catch (e) {
+        if (!loginAbort) {
+            const msg = (e instanceof TypeError)
+                ? "Gagal terhubung ke GitHub. Login kode hanya jalan di APK; di browser pakai token manual."
+                : e.message;
+            alert(msg);
+        }
+        resetLoginUi();
+    } finally {
+        btn.disabled = false;
+        await bg('stop', { text: TOKEN ? "Login GitHub berhasil" : "Login dibatalkan" });
+    }
+}
+
+async function pollToken(clientId, d) {
+    let interval = (d.interval || 5) * 1000;
+    const deadline = Date.now() + (d.expires_in || 900) * 1000;
+    while (!loginAbort && Date.now() < deadline) {
+        await sleepOrWake(interval);
+        if (loginAbort) break;
+        const t = await postJson('https://github.com/login/oauth/access_token', {
+            client_id: clientId,
+            device_code: d.device_code,
+            grant_type: 'urn:ietf:params:oauth:grant-type:device_code'
         });
-        if(!res.ok) throw new Error("Invalid Token");
+        if (t.access_token) return t.access_token;
+        if (t.error === 'authorization_pending') continue;
+        if (t.error === 'slow_down') { interval = (t.interval ? t.interval * 1000 : interval + 5000); continue; }
+        if (t.error === 'expired_token') throw new Error("Kode kedaluwarsa, coba login lagi.");
+        if (t.error === 'access_denied') throw new Error("Login ditolak.");
+        throw new Error(t.error_description || t.error || "Login gagal");
+    }
+    if (loginAbort) throw new Error("dibatalkan");
+    throw new Error("Kode kedaluwarsa, coba login lagi.");
+}
+
+function setLoginStatus(t) { document.getElementById('loginStatus').textContent = t; }
+
+async function copyCode(silent) {
+    const code = document.getElementById('userCode').textContent;
+    try {
+        await navigator.clipboard.writeText(code);
+        setLoginStatus(silent ? "Kode disalin. Buka GitHub lalu tempel." : "Kode disalin.");
+    } catch (e) {
+        if (!silent) alert("Salin manual: " + code);
+    }
+}
+
+function openVerify() {
+    window.open(window.__verifyUrl || 'https://github.com/login/device', '_blank');
+}
+
+function cancelLogin() {
+    loginAbort = true;
+    if (wakeUp) wakeUp();
+    resetLoginUi();
+}
+
+function resetLoginUi() {
+    document.getElementById('loginCode').classList.add('hidden');
+    document.getElementById('loginIdle').classList.remove('hidden');
+}
+
+async function connectManual() {
+    const t = document.getElementById('token').value.trim();
+    if (!t) return;
+    TOKEN = t;
+    localStorage.setItem('kg_token', TOKEN);
+    await loadRepos();
+}
+
+async function loadRepos() {
+    try {
+        const [meRes, res] = await Promise.all([
+            fetch('https://api.github.com/user', { headers: ghHeaders() }),
+            fetch('https://api.github.com/user/repos?per_page=100&sort=pushed', { headers: ghHeaders() })
+        ]);
+        if (meRes.status === 401 || res.status === 401) throw new Error("Sesi login habis, silakan login lagi.");
+        if (!res.ok) throw new Error("Gagal memuat repo (" + res.status + ")");
+        const me = await meRes.json();
         const d = await res.json();
+        document.getElementById('whoami').textContent = "@" + me.login;
         document.getElementById('repoList').innerHTML = d.map(r => `<option value="${r.full_name}">${r.full_name}</option>`).join('');
         document.getElementById('step1').classList.add('hidden');
         document.getElementById('step2').classList.remove('hidden');
         writeLog("Ready.");
-    } catch(e) { 
-        alert(e.message); 
+    } catch (e) {
+        TOKEN = "";
+        localStorage.removeItem('kg_token');
+        resetLoginUi();
+        document.getElementById('step1').classList.remove('hidden');
+        document.getElementById('step2').classList.add('hidden');
+        alert(e.message);
     }
+}
+
+function logout() {
+    TOKEN = "";
+    localStorage.removeItem('kg_token');
+    document.getElementById('step2').classList.add('hidden');
+    document.getElementById('step1').classList.remove('hidden');
+    resetLoginUi();
 }
 
 async function startDeploy() {
@@ -61,13 +213,13 @@ async function startDeploy() {
     try {
         writeLog(`Initializing ${repo}...`);
         const repoRes = await fetch(`https://api.github.com/repos/${repo}`, { 
-            headers: {'Authorization': `token ${TOKEN}`} 
+            headers: ghHeaders() 
         });
         const repoInfo = await repoRes.json();
         const branch = repoInfo.default_branch;
         
         const branchRes = await fetch(`https://api.github.com/repos/${repo}/branches/${branch}`, { 
-            headers: {'Authorization': `token ${TOKEN}`} 
+            headers: ghHeaders() 
         });
         const branchInfo = await branchRes.json();
         const parentSha = branchInfo.commit.sha;
@@ -89,7 +241,7 @@ async function startDeploy() {
             const b64 = await getBase64(content);
             const blobRes = await fetch(`https://api.github.com/repos/${repo}/git/blobs`, {
                 method: 'POST', 
-                headers: {'Authorization': `token ${TOKEN}`, 'Content-Type': 'application/json'},
+                headers: ghHeaders(true),
                 body: JSON.stringify({ content: b64, encoding: 'base64' })
             });
             const blob = await blobRes.json();
@@ -103,21 +255,21 @@ async function startDeploy() {
         
         const treeRes = await fetch(`https://api.github.com/repos/${repo}/git/trees`, {
             method: 'POST', 
-            headers: {'Authorization': `token ${TOKEN}`, 'Content-Type': 'application/json'},
+            headers: ghHeaders(true),
             body: JSON.stringify({ tree })
         });
         const newTree = await treeRes.json();
         
         const commitRes = await fetch(`https://api.github.com/repos/${repo}/git/commits`, {
             method: 'POST', 
-            headers: {'Authorization': `token ${TOKEN}`, 'Content-Type': 'application/json'},
+            headers: ghHeaders(true),
             body: JSON.stringify({ message: "⚡ kev-git build", tree: newTree.sha, parents: [parentSha] })
         });
         const commit = await commitRes.json();
         
         const refRes = await fetch(`https://api.github.com/repos/${repo}/git/refs/heads/${branch}`, {
             method: 'PATCH', 
-            headers: {'Authorization': `token ${TOKEN}`, 'Content-Type': 'application/json'},
+            headers: ghHeaders(true),
             body: JSON.stringify({ sha: commit.sha, force: true })
         });
         if(!refRes.ok) throw new Error("Gagal memperbarui branch (" + refRes.status + ")");

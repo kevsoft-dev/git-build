@@ -22,14 +22,39 @@
 
         <main>
             <div id="step1">
-                <div class="form-group">
-                    <label>GitHub Personal Token</label>
-                    <input type="password" id="token" placeholder="ghp_...">
+                <div id="loginIdle">
+                    <button class="btn" id="loginBtn" onclick="startLogin()">Login dengan GitHub</button>
+                    <div class="hint">Kamu akan dapat kode, lalu masukkan di github.com/login/device.</div>
                 </div>
-                <button class="btn" onclick="connect()">Connect Engine</button>
+
+                <div id="loginCode" class="hidden">
+                    <label>Masukkan kode ini di GitHub</label>
+                    <div class="code-box" id="userCode">----</div>
+                    <button class="btn" onclick="copyCode()">Salin kode</button>
+                    <button class="btn btn-ghost" onclick="openVerify()">Buka github.com/login/device</button>
+                    <div class="hint" id="loginStatus">Menunggu otorisasi...</div>
+                    <div class="clear-btn" onclick="cancelLogin()" style="margin-top:14px;text-align:center">batal</div>
+                </div>
+
+                <details class="adv">
+                    <summary>Pengaturan</summary>
+                    <div class="form-group">
+                        <label>OAuth Client ID (device flow aktif)</label>
+                        <input type="text" id="clientId" placeholder="Ov23li...">
+                    </div>
+                    <div class="form-group">
+                        <label>Atau pakai token manual</label>
+                        <input type="password" id="token" placeholder="ghp_...">
+                    </div>
+                    <button class="btn btn-ghost" onclick="connectManual()">Pakai token</button>
+                </details>
             </div>
-            
+
             <div id="step2" class="hidden">
+                <div class="userbar">
+                    <span id="whoami">@...</span>
+                    <span class="clear-btn" onclick="logout()">logout</span>
+                </div>
                 <div class="form-group">
                     <label>Target Repository</label>
                     <select id="repoList"></select>
