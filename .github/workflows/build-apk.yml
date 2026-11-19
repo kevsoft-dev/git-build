@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: build-apk-${{ github.ref }}
@@ -79,3 +79,16 @@ jobs:
           path: android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 30
+
+      - name: Rilis otomatis ke GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v1.0.${{ github.run_number }}"
+          cp android/app/build/outputs/apk/debug/app-debug.apk "kev-git-${tag}.apk"
+          test -s "kev-git-${tag}.apk" || { echo "::error::File APK kosong atau tidak ada."; exit 1; }
+          gh release create "$tag" "kev-git-${tag}.apk" \
+            --target "${{ github.sha }}" \
+            --title "kev-git ${tag}" \
+            --notes "Build otomatis #${{ github.run_number }} dari commit ${GITHUB_SHA::7}. Unduh file .apk lalu instal."
+          echo "Rilis dibuat: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${tag}"
