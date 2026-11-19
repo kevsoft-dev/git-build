@@ -69,25 +69,59 @@ jobs:
           [[ -z "$VERSION_CODE_IN" || "$VERSION_CODE_IN" =~ ^[0-9]{1,9}$ ]] || fail "Version code harus angka"
           echo "VERSION_CODE=${VERSION_CODE_IN:-$RUN_NUMBER}" >> "$GITHUB_ENV"
 
-      - name: Pasang Java 17
+      - name: Pasang Java 17 (Temurin)
+        id: java-temurin
+        continue-on-error: true
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Pasang Gradle 8.7
-        uses: gradle/actions/setup-gradle@v6
+      - name: Pasang Java 17 (cadangan 1 - Zulu)
+        id: java-zulu
+        if: steps.java-temurin.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/setup-java@v5
         with:
-          gradle-version: "8.7"
+          distribution: zulu
+          java-version: "17"
 
-      - name: Build APK
+      - name: Pasang Java 17 (cadangan 2 - bawaan runner)
+        if: steps.java-temurin.outcome == 'failure' && steps.java-zulu.outcome == 'failure'
         run: |
-          gradle assembleDebug --no-daemon --stacktrace \
-            -PappName="$APP_NAME" \
-            -PappPackage="$PACKAGE_NAME" \
-            -PappVersion="$VERSION_NAME" \
-            -PappCode="$VERSION_CODE" \
-            -PiconColor="${ICON_COLOR#\#}"
+          [ -n "${JAVA_HOME_17_X64:-}" ] || { echo "::error::JDK 17 tidak tersedia"; exit 1; }
+          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_17_X64/bin" >> "$GITHUB_PATH"
+
+      - name: Siapkan Android SDK (sdkmanager resmi)
+        run: |
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "sdk.dir=$SDK" > local.properties
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SM" ] || SM="$(command -v sdkmanager || true)"
+          if [ -n "$SM" ]; then
+            echo "SDKMANAGER=$SM" >> "$GITHUB_ENV"
+            yes | "$SM" --licenses >/dev/null 2>&1 || true
+            "$SM" "platforms;android-34" "build-tools;34.0.0" \
+              || echo "::warning::sdkmanager gagal, lanjut dengan SDK bawaan runner"
+          else
+            echo "::warning::sdkmanager tidak ditemukan, memakai SDK bawaan runner"
+          fi
+          java -version 2>&1 | head -1
+          ls "$SDK/platforms" "$SDK/build-tools" 2>/dev/null || true
+
+      - name: Build APK (otomatis coba beberapa cadangan)
+        run: bash scripts/build.sh
+
+      - name: Simpan log build
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: build-logs
+          path: build-logs/
+          if-no-files-found: ignore
 
       - name: Beri nama file APK
         run: |

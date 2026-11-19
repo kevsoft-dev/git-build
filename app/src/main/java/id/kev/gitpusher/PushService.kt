@@ -80,7 +80,7 @@ class PushService : Service() {
         val wake = (getSystemService(POWER_SERVICE) as PowerManager)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "gitpusher:push")
         wake.acquire(6 * 60 * 60 * 1000L)
-        var summary: String
+        var summary = ""
         try {
             val tmp = File(cacheDir, "in.zip")
             contentResolver.openInputStream(Uri.parse(i.getStringExtra("zip")))!!.use { a ->

@@ -16,3 +16,9 @@ Aplikasi Android untuk push isi ZIP ke repo GitHub, 1 file = 1 commit
 Jalankan ulang aman: file yang sama dilewati.
 
 Android Studio: File → Open folder ini, lalu Run.
+
+## Jika build gagal
+Workflow otomatis mencoba 4 kombinasi (Gradle/AGP/Kotlin sesuai tabel kompatibilitas
+resmi developer.android.com), mengunduh Gradle dari 5 sumber (resmi + mirror, diverifikasi sha256),
+dan memasang SDK lewat sdkmanager. Bila semua gagal, baris error tampil di
+**halaman run → Summary** dan log lengkap ada di **Artifacts → build-logs**.
