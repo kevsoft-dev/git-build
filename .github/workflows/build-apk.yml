@@ -1,148 +1,81 @@
 name: Build APK
 
-run-name: Build ${{ inputs.app_name }} v${{ inputs.version_name }} (#${{ github.run_number }})
-
-# Manual: tombol "Run workflow" di tab Actions
 on:
   workflow_dispatch:
-    inputs:
-      app_name:
-        description: "Nama aplikasi (tampil di HP)"
-        required: true
-        default: "Git Pusher"
-        type: string
-      package_name:
-        description: "Package / Application ID (huruf kecil, contoh: id.kev.gitpusher)"
-        required: true
-        default: "id.kev.gitpusher"
-        type: string
-      version_name:
-        description: "Versi aplikasi (contoh: 1.0)"
-        required: true
-        default: "1.0"
-        type: string
-      version_code:
-        description: "Version code (angka). Kosong = nomor build otomatis"
-        required: false
-        type: string
-      icon_color:
-        description: "Warna latar logo GitHub (hex 6 digit, contoh: 24292F)"
-        required: true
-        default: "24292F"
-        type: string
-      make_release:
-        description: "Buat Release agar APK bisa diunduh langsung dari HP"
-        required: true
-        default: true
-        type: boolean
-      release_notes:
-        description: "Catatan rilis (opsional)"
-        required: false
-        type: string
 
 permissions:
-  contents: write   # untuk membuat Release berisi APK
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build-apk:
-    name: Build APK
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      APP_NAME: ${{ inputs.app_name }}
-      PACKAGE_NAME: ${{ inputs.package_name }}
-      VERSION_NAME: ${{ inputs.version_name }}
-      VERSION_CODE_IN: ${{ inputs.version_code }}
-      ICON_COLOR: ${{ inputs.icon_color }}
-      RUN_NUMBER: ${{ github.run_number }}
+    timeout-minutes: 40
+
     steps:
-      - name: Ambil kode
-        uses: actions/checkout@v6
+      - name: Checkout kode
+        uses: actions/checkout@v4
 
-      - name: Cek pengaturan
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependensi
         run: |
-          fail() { echo "::error::$1"; exit 1; }
-          [[ -n "${APP_NAME// /}" ]] || fail "Nama aplikasi tidak boleh kosong"
-          [[ "$PACKAGE_NAME" =~ ^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$ ]] \
-            || fail "Package tidak valid. Contoh benar: id.kev.gitpusher (huruf kecil, minimal 2 bagian dipisah titik)"
-          [[ "${ICON_COLOR#\#}" =~ ^[0-9A-Fa-f]{6}$ ]] || fail "Warna logo harus hex 6 digit, contoh 24292F"
-          [[ -z "$VERSION_CODE_IN" || "$VERSION_CODE_IN" =~ ^[0-9]{1,9}$ ]] || fail "Version code harus angka"
-          echo "VERSION_CODE=${VERSION_CODE_IN:-$RUN_NUMBER}" >> "$GITHUB_ENV"
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
-      - name: Pasang Java 17 (Temurin)
-        id: java-temurin
-        continue-on-error: true
-        uses: actions/setup-java@v5
+      - name: Pilih versi JDK sesuai Capacitor
+        id: jdk
+        run: |
+          test -d node_modules/@capacitor/android || { echo "::error::@capacitor/android belum ada di package.json (dependencies)."; exit 1; }
+          major=$(node -p "require('./node_modules/@capacitor/android/package.json').version.split('.')[0]")
+          if [ "$major" -ge 7 ]; then echo "version=21" >> "$GITHUB_OUTPUT"; else echo "version=17" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Setup JDK
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: ${{ steps.jdk.outputs.version }}
 
-      - name: Pasang Java 17 (cadangan 1 - Zulu)
-        id: java-zulu
-        if: steps.java-temurin.outcome == 'failure'
-        continue-on-error: true
-        uses: actions/setup-java@v5
+      - name: Siapkan folder web (www)
+        run: |
+          rm -rf www && mkdir www
+          cp index.html app.js style.css www/
+          cp node_modules/jszip/dist/jszip.min.js www/jszip.min.js
+          sed -i 's#https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js#jszip.min.js#' www/index.html
+          grep -q 'src="jszip.min.js"' www/index.html || { echo "::error::Gagal mengganti sumber JSZip di index.html."; exit 1; }
+          test -f www/index.html
+
+      - name: Tambah platform Android bila belum ada
+        run: test -d android || npx cap add android
+
+      - name: Pasang layanan latar belakang (foreground service)
+        run: |
+          pkg_dir=android/app/src/main/java/com/kevsoft/gittools
+          test -d "$pkg_dir" || { echo "::error::Folder $pkg_dir tidak ada. Pastikan appId di capacitor.config.json adalah com.kevsoft.gittools."; exit 1; }
+          cp native/BgService.java native/BgServicePlugin.java native/MainActivity.java "$pkg_dir/"
+          python3 native/patch_manifest.py android/app/src/main/AndroidManifest.xml
+
+      - name: Sinkronkan aset web ke Android
+        run: npx cap sync android
+
+      - name: Build APK debug
+        working-directory: android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --stacktrace -Dorg.gradle.jvmargs=-Xmx3g assembleDebug
+
+      - name: Daftar APK hasil build
+        run: find android -name "*.apk" -type f
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
         with:
-          distribution: zulu
-          java-version: "17"
-
-      - name: Pasang Java 17 (cadangan 2 - bawaan runner)
-        if: steps.java-temurin.outcome == 'failure' && steps.java-zulu.outcome == 'failure'
-        run: |
-          [ -n "${JAVA_HOME_17_X64:-}" ] || { echo "::error::JDK 17 tidak tersedia"; exit 1; }
-          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
-          echo "$JAVA_HOME_17_X64/bin" >> "$GITHUB_PATH"
-
-      - name: Siapkan Android SDK (sdkmanager resmi)
-        run: |
-          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          echo "sdk.dir=$SDK" > local.properties
-          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
-          [ -x "$SM" ] || SM="$(command -v sdkmanager || true)"
-          if [ -n "$SM" ]; then
-            echo "SDKMANAGER=$SM" >> "$GITHUB_ENV"
-            yes | "$SM" --licenses >/dev/null 2>&1 || true
-            "$SM" "platforms;android-34" "build-tools;34.0.0" \
-              || echo "::warning::sdkmanager gagal, lanjut dengan SDK bawaan runner"
-          else
-            echo "::warning::sdkmanager tidak ditemukan, memakai SDK bawaan runner"
-          fi
-          java -version 2>&1 | head -1
-          ls "$SDK/platforms" "$SDK/build-tools" 2>/dev/null || true
-
-      - name: Build APK (otomatis coba beberapa cadangan)
-        run: bash scripts/build.sh
-
-      - name: Simpan log build
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: build-logs
-          path: build-logs/
-          if-no-files-found: ignore
-
-      - name: Beri nama file APK
-        run: |
-          SAFE=$(printf '%s' "$APP_NAME" | tr -c 'A-Za-z0-9' '-' | sed 's/-*$//; s/^-*//')
-          APK="${SAFE:-App}-v${VERSION_NAME}.apk"
-          cp app/build/outputs/apk/debug/app-debug.apk "$APK"
-          echo "APK_FILE=$APK" >> "$GITHUB_ENV"
-
-      - name: Simpan APK (Artifacts)
-        uses: actions/upload-artifact@v6
-        with:
-          name: apk
-          path: ${{ env.APK_FILE }}
-
-      - name: Buat Release
-        if: ${{ inputs.make_release }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          NOTES: ${{ inputs.release_notes }}
-        run: |
-          DEFAULT_NOTES="APK dibuat otomatis dari commit ${GITHUB_SHA::7}. Package: $PACKAGE_NAME"
-          gh release create "v${VERSION_NAME}-build${RUN_NUMBER}" "$APK_FILE" \
-            --title "$APP_NAME v${VERSION_NAME} (build ${RUN_NUMBER})" \
-            --notes "${NOTES:-$DEFAULT_NOTES}"
+          name: apk-debug
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 30
