@@ -1,7 +1,7 @@
 // ===== kev-git: deploy ZIP ke GitHub hanya pakai Personal Access Token (API key) =====
 const API = 'https://api.github.com';
 const MAX_FILE_BYTES = 50 * 1024 * 1024;   // file lebih besar dilewati (batas aman blob API)
-const PARALLEL = 4;                         // jumlah upload blob bersamaan
+const PARALLEL = 1;                         // 1 per 1: file diproses berurutan, tidak paralel
 let TOKEN = localStorage.getItem('kg_token') || "";
 
 // Layanan latar belakang Android (hanya ada di dalam APK; di browser diabaikan)
@@ -23,10 +23,30 @@ if (window.addEventListener) {
 
 document.addEventListener("DOMContentLoaded", () => {
     renderHistory();
+    const pf = document.getElementById('perFile');
+    if (pf) {
+        pf.checked = localStorage.getItem('kg_perfile') !== '0';
+        pf.addEventListener('change', () => localStorage.setItem('kg_perfile', pf.checked ? '1' : '0'));
+    }
     if (TOKEN) loadRepos(true);
 });
 
+let lastLogAt = Date.now();
+let curStep = "";
+let watchdog = null;
+function setStep(s) { curStep = s; }
+function startWatchdog() {
+    stopWatchdog();
+    lastLogAt = Date.now();
+    watchdog = setInterval(() => {
+        const idle = Date.now() - lastLogAt;
+        if (idle >= 12000) writeLog(`Masih berjalan: ${curStep || 'menunggu'} (${Math.round(idle / 1000)} dtk tanpa respons)`, "#f5a623");
+    }, 6000);
+}
+function stopWatchdog() { if (watchdog) { clearInterval(watchdog); watchdog = null; } }
+
 function writeLog(text, color = "#00ff66") {
+    lastLogAt = Date.now();
     const l = document.getElementById('log');
     l.style.display = "block";
     const e = document.createElement('div');
@@ -268,6 +288,61 @@ function autoMessage(created, updated, deleted) {
     return `Update ${total} files`;
 }
 
+
+async function getFileSha(repo, branch, path) {
+    const r = await gh(`/repos/${repo}/contents/${encPath(path)}?ref=${encodeURIComponent(branch)}`);
+    if (r.status === 404) return null;
+    await must(r, "Cek file " + path);
+    const j = await r.json();
+    return Array.isArray(j) ? null : j.sha;
+}
+
+// Mode "1 per 1": setiap file jadi satu commit sendiri, berurutan, seperti edit manual
+async function pushPerFile(repo, branch, zip, items, created, updated, deleted, existing, customMsg) {
+    const jobs = [
+        ...created.map(p => ({ kind: 'add', path: p })),
+        ...updated.map(p => ({ kind: 'update', path: p })),
+        ...deleted.map(p => ({ kind: 'delete', path: p }))
+    ];
+    let n = 0;
+    for (const j of jobs) {
+        n++;
+        const label = `(${n}/${jobs.length})`;
+        const verb = j.kind === 'add' ? 'Add' : j.kind === 'update' ? 'Update' : 'Delete';
+        const msg = customMsg || `${verb} ${j.path}`;
+        setStep(`${verb} ${j.path}`);
+        writeLog(`${label} ${verb} ${j.path}`);
+        bg('update', { text: `${label} ${j.path}` });
+
+        let sha = existing && existing.get(j.path) ? existing.get(j.path).sha : null;
+        if (!existing && j.kind !== 'add') sha = await getFileSha(repo, branch, j.path);
+        if (!existing && j.kind === 'add') sha = await getFileSha(repo, branch, j.path);
+
+        if (j.kind === 'delete') {
+            if (!sha) { writeLog("Sudah tidak ada, lewati: " + j.path, "#f5a623"); continue; }
+            const d = await gh(`/repos/${repo}/contents/${encPath(j.path)}`, { method: 'DELETE', body: { message: msg, sha, branch } });
+            if (d.status !== 404) await must(d, "Hapus " + j.path);
+        } else {
+            const data = await zip.files[items.get(j.path)].async("uint8array");
+            const content = data.length ? toBase64(data) : "";
+            const send = async (s) => {
+                const body = { message: msg, content, branch };
+                if (s) body.sha = s;
+                return gh(`/repos/${repo}/contents/${encPath(j.path)}`, { method: 'PUT', body, timeout: 180000 });
+            };
+            let r = await send(sha);
+            if (!r.ok && (r.status === 409 || r.status === 422)) {
+                // sha tidak cocok / file sudah ada: ambil sha terbaru lalu coba sekali lagi
+                const fresh = await getFileSha(repo, branch, j.path);
+                r = await send(fresh);
+            }
+            if (!r.ok && !data.length) { writeLog("Lewati file kosong: " + j.path, "#f5a623"); continue; }
+            await must(r, "Push " + j.path);
+        }
+        await sleep(400);   // jeda kecil antar commit, urutannya rapi di riwayat GitHub
+    }
+}
+
 // ===== Deploy =====
 async function startDeploy() {
     const repo = document.getElementById('repoList').value;
@@ -275,16 +350,21 @@ async function startDeploy() {
     if (!repo) return alert("Pilih repo!");
     if (!file) return alert("Pilih ZIP!");
     const customMsg = (document.getElementById('commitMsg').value || "").trim();
+    const pfEl = document.getElementById('perFile');
+    const perFile = pfEl ? pfEl.checked : true;
     const btn = document.getElementById('deployBtn');
     btn.disabled = true;
     let finalText = "Deploy gagal";
     writeLog(`Memulai deploy ke ${repo}...`);
-    bg('start', { text: `Mengunggah ke ${repo}...` });   // tidak ditunggu, supaya log tidak tertahan
+    startWatchdog();
 
     try {
         writeLog(`Initializing ${repo}...`);
+        setStep("membaca info repo");
         const repoRes = await gh(`/repos/${repo}`);
         await must(repoRes, "Membaca repo");
+        // Layanan latar baru dinyalakan setelah GitHub merespons, jadi tidak bisa menahan awal proses
+        setTimeout(() => bg('start', { text: `Mengunggah ke ${repo}...` }), 0);
         const repoInfo = await repoRes.json();
         if (repoInfo.archived) throw new Error("Repo diarsipkan (read-only).");
         if (repoInfo.permissions && repoInfo.permissions.push === false) throw new Error("Token tidak punya izin push ke repo ini.");
@@ -293,6 +373,7 @@ async function startDeploy() {
         // Baca ZIP
         if (typeof JSZip === 'undefined') throw new Error("Library ZIP belum termuat. Cek internet lalu buka ulang app.");
         writeLog("Membaca ZIP...");
+        setStep("membaca ZIP");
         let zip;
         try { zip = await JSZip.loadAsync(await file.arrayBuffer()); }
         catch (e) { throw new Error("File ZIP rusak atau tidak bisa dibaca."); }
@@ -329,13 +410,16 @@ async function startDeploy() {
             return { path, data: await zip.files[zipName].async("uint8array") };
         };
 
+        setStep("memeriksa branch");
         const branchSha = await ensureBranch(repo, branch, getInit);
+        setStep("membaca isi repo");
         const existing = await readExistingTree(repo, branchSha);
         if (!existing) writeLog("Tidak bisa membandingkan dengan isi repo, semua file diunggah.", "#f5a623");
 
         // Upload hanya file yang baru / berubah
         const tree = [];
         const created = [], updated = [];
+        setStep("membandingkan file");
         let done = 0, same = 0;
         await runPool(list, PARALLEL, async ([path, zipName]) => {
             const zf = zip.files[zipName];
@@ -355,8 +439,10 @@ async function startDeploy() {
                 tree.push({ path, mode, type: "blob", sha });
                 return;
             }
+            if (perFile) { (old ? updated : created).push(path); return; }   // diunggah nanti, 1 per 1
+            setStep("upload " + path);
             bg('update', { text: `Mengunggah ${done}/${list.length}: ${path}` });
-            writeLog("Push: " + path);
+            writeLog(`Push (${done}/${list.length}): ${path}`);
             const body = data.length
                 ? { content: toBase64(data), encoding: 'base64' }
                 : { content: "", encoding: 'utf-8' };
@@ -370,7 +456,7 @@ async function startDeploy() {
             tree.push({ path, mode, type: "blob", sha: blob.sha });
             (old ? updated : created).push(path);
         });
-        if (!tree.length) throw new Error("Tidak ada file yang berhasil diunggah.");
+        if (!perFile && !tree.length) throw new Error("Tidak ada file yang berhasil diunggah.");
 
         // File yang ada di repo tapi tidak ada di ZIP = dihapus (submodule dibiarkan)
         const deleted = [];
@@ -388,6 +474,16 @@ async function startDeploy() {
             finalText = "Tidak ada perubahan: " + repo;
             writeLog("Tidak ada perubahan, tidak ada commit dibuat.", "#50e3c2");
             alert("Isi ZIP sama persis dengan repo, tidak ada yang perlu di-push.");
+            return;
+        }
+
+        if (perFile) {
+            writeLog(`Mode 1 per 1: ${created.length + updated.length + deleted.length} commit.`);
+            await pushPerFile(repo, branch, zip, items, created, updated, deleted, existing, customMsg);
+            finalText = "Deploy selesai: " + repo;
+            writeLog(`Selesai: ${created.length} baru, ${updated.length} diubah, ${deleted.length} dihapus, ${same} tetap.`, "#50e3c2");
+            saveHistory(repo);
+            alert("Done!");
             return;
         }
 
@@ -425,6 +521,7 @@ async function startDeploy() {
         writeLog("Error: " + e.message, "#ee0000");
         if (e instanceof FatalError) logout();
     } finally {
+        stopWatchdog();
         btn.disabled = false;
         bg('stop', { text: finalText });
     }

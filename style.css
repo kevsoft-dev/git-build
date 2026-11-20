@@ -250,3 +250,17 @@ footer a:hover {
     cursor: pointer;
     margin-bottom: 16px;
 }
+
+.check {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 13px;
+    color: var(--v-gray-700);
+    margin-bottom: 18px;
+}
+
+.check input {
+    width: auto;
+    margin: 0;
+}
